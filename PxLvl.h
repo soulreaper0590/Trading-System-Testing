@@ -1,15 +1,15 @@
 #pragma once
 
+#include "Utils.h"
 #include "DoubleLinkedList.h"
 #include "OrderNode.h"
-#include "Utils.h
 
 struct PxLvl : public DoubleLinkedList<OrderNode> {
 public:
-    explicit PxLvl(ordPx_t aPx = 0, exchange_ticker aTicker = 0) : px_(aPx), ticker_(aTicker) {}
+    explicit PxLvl(ordPx_t aPx = 0, ExchangeTicker aTicker = 0) : px_(aPx), ticker_(aTicker) {}
     ~PxLvl() { deleteAllOrders(); }
 
-    inline exchange_ticker ticker() const { return ticker_; }
+    inline ExchangeTicker ticker() const { return ticker_; }
     inline ordPx_t px()        const { return px_; }
     inline ordSz_t cumSz()     const { return cumSz_; }
     inline int     orderCount()      { return DoubleLinkedList<OrderNode>::size(); }
@@ -30,43 +30,32 @@ public:
     // Keep cumSz_ correct when a resting order's size changes in place.
     inline void adjustCumSz(ordSz_t aDelta) { cumSz_ += aDelta; }
 
-    inline void matchOrders(OrderNode* aTaker,
-                            std::vector<Trade>& aTrades,
-                            std::vector<ordId_t>& aFilledOrderIds) {
+    inline ordSz_t matchOrders(OrderNode* aArgessor, std::vector<ordId_t>& aMatchedOrders) { // will return if there is volume left or not.
         auto myIt = DoubleLinkedList<OrderNode>::begin();
-        int  myConsumedPrefix = 0;
 
-        while (myIt != DoubleLinkedList<OrderNode>::end() && aTaker->sz() > 0) {
-            OrderNodePtr myMaker  = *myIt;
-            ordSz_t myTradeSz = myMaker->sz() < aTaker->sz() ? myMaker->sz() : aTaker->sz();
+        while (myIt != DoubleLinkedList<OrderNode>::end() & aArgessor->sz() > 0) {
+            OrderNodePtr myPassiveOrder  = *myIt;
+            ordSz_t myTradeSz = std::min(aArgessor->sz(), myPassiveOrder->sz());
 
             // Reduce both orders by the traded quantity (sizes updated in place).
-            myMaker->fill(myTradeSz);
-            aTaker->fill(myTradeSz);
+            
             cumSz_ -= myTradeSz;
-
             // Print a line for BOTH orders; aggressor side is the same in both.
-            printTrade(myMaker->id(), myTradeSz, aTaker->side());
-            printTrade(aTaker->id(),  myTradeSz, aTaker->side());
-            aTrades.push_back(Trade{aTaker->id(), myMaker->id(), px_, myTradeSz, aTaker->side()});
-
-            if (myMaker->sz() > 0) break;   // maker partial => aggressor exhausted
-
-            // Maker fully consumed; keep going down the queue.
-            aFilledOrderIds.push_back(myMaker->id());
-            myConsumedPrefix++;
+            aArgessor->fill(myTradeSz);
+            printTrade(aArgessor->id(),  myTradeSz, aArgessor->side());
+            printTrade(myPassiveOrder->id(), myTradeSz, aArgessor->side());
             ++myIt;
+            if(myPassiveOrder->fill(myTradeSz)){
+                removeOrder(myPassiveOrder);
+                aMatchedOrders.push_back(myPassiveOrder->id());
+            }
         }
 
         // Detach the fully consumed prefix from the list (nodes deleted by book).
         if (myIt == DoubleLinkedList<OrderNode>::end()) {
             DoubleLinkedList<OrderNode>::clear();
-        } else if (myConsumedPrefix > 0) {
-            OrderNodePtr myNewHead = *myIt;
-            myNewHead->prev = nullptr;
-            head_ = myNewHead;
-            size_ -= myConsumedPrefix;
         }
+        return aArgessor->sz();
     }
 
     // Emitted for BOTH orders involved in a fill (the resting maker and the
@@ -78,14 +67,13 @@ public:
     }
 
     void print(FILE* aStream = stdout) {
-        fprintf(aStream, "  px=%g cumSz=%ld count=%d : ",
-                px_, cumSz_, DoubleLinkedList<OrderNode>::size());
-        for (auto myIt = DoubleLinkedList<OrderNode>::begin();
-             myIt != DoubleLinkedList<OrderNode>::end(); ++myIt) {
-            (*myIt)->print(aStream);
-            fprintf(aStream, " ");
+        printf( "  px=%g cumSz=%ld",
+                px_, cumSz_);
+        for (auto myIt = DoubleLinkedList<OrderNode>::begin(); myIt != DoubleLinkedList<OrderNode>::end(); ++myIt) {
+            (*myIt)->print();
+            printf(" ");
         }
-        fprintf(aStream, "\n");
+        printf("\n");
     }
 
     inline void deleteAllOrders() {
@@ -100,9 +88,9 @@ public:
     }
 
 private:
-    const ordPx_t         px_;
-    ordSz_t               cumSz_  = 0;
-    const exchange_ticker ticker_ = 0;
+    const ordPx_t px_; // this has to be 
+    ordSz_t cumSz_  = 0;
+    const ExchangeTicker ticker_ = 0;
 };
 
 using PxLvlPtr = PxLvl*;
