@@ -3,16 +3,16 @@
 
 class OrderBook {
 public:
-    using Px2PxLvl   = std::map<ordPx_t, PxLvlPtr>;
-    using Id2OrderPtr = std::unordered_map<ordId_t, OrderNodePtr>;
+    using Px2PxLvl   = std::map<ordPx_t, PxLvlPtr>; // PxLvl maps bids and asks
+    using Id2OrderPtr = std::unordered_map<ordId_t, OrderNodePtr>; // OrderId to OrderNode* map 
 
-    explicit OrderBook(exchange_ticker aTicker = 0) : ticker_(aTicker) {}
+    explicit OrderBook(ExchangeTicker aTicker) : ticker_(aTicker) {}
     ~OrderBook() {
         for (auto& kv : bids_) delete kv.second;
         for (auto& kv : asks_) delete kv.second;
     }
 
-    inline exchange_ticker ticker() const { return ticker_; }
+    inline ExchangeTicker ticker() const { return ticker_; }
 
     OrderBook(const OrderBook&)            = delete;
     OrderBook& operator=(const OrderBook&) = delete;
@@ -41,33 +41,25 @@ public:
      * 2. Any remaining quantity rests on this order's own side (time priority
      *    = arrival order within its price level).
      */
-    std::vector<Trade> addOrder(ordId_t aId, Side aSide, ordPx_t aPx, ordSz_t aSz) {
-        std::vector<Trade> myTrades;
-        if (aSz <= 0 || isOrdExist(aId)) return myTrades;
-
-        Timestamp myTs = nextTs();
-        OrderNodePtr myOrd = new OrderNode(aId, aSide, aPx, aSz, myTs);
-
+    template<bool IS_BUY>
+    void addOrder(ordId_t aId, Side aSide, ordPx_t aPx, ordSz_t aSz) {
+        OrderNodePtr myOrd = new OrderNode(aId, aSide, aPx, aSz);
+        int myRemainingSz = aSz;
         // Aggressor size is reduced in place while matching.
-        if (aSide == Side::BUY) matchAgainst(asks_, myOrd, /*takerIsBuy=*/true,  myTrades);
-        else                    matchAgainst(bids_, myOrd, /*takerIsBuy=*/false, myTrades);
+        if constexpr (IS_BUY){matchAgainstAsks(myOrd);}
+        else{matchAgainstBids(myOrd);}
 
         if (myOrd->sz() > 0) {
-            restOrder(myOrd);                 // remainder becomes a resting (maker) order
+            addOrderToBook(myOrd);    // remainder becomes a resting (maker) order
         } else {
             delete myOrd;                     // fully filled on arrival
         }
-        return myTrades;
+        return;
     }
 
     // Cancel a resting order. Returns true if it existed.
-    bool cancelOrder(ordId_t aId) {
-        auto myIt = orderMap_.find(aId);
-        if (myIt == orderMap_.end()) return false;
-        OrderNodePtr myOrd = myIt->second;
-        removeResting(myOrd);                 // unlink + drop empty level + erase map
-        delete myOrd;
-        return true;
+    void cancelOrder(ordId_t aId) {
+        cleanOrderExistenceFromBook(aId);
     }
 
     /*
@@ -80,61 +72,72 @@ public:
      * Returns the trades produced by the (possibly re-crossing) amend. If the
      * order id does not exist, returns empty and sets aOk=false.
      */
-    std::vector<Trade> amendOrder(ordId_t aId, ordPx_t aNewPx, ordSz_t aNewSz, bool& aOk) {
-        std::vector<Trade> myTrades;
-        auto myIt = orderMap_.find(aId);
-        if (myIt == orderMap_.end()) { aOk = false; return myTrades; }
-        aOk = true;
-
-        OrderNodePtr myOrd = myIt->second;
-        Side mySide = myOrd->side();
-
+    template<bool IS_BUY>
+    bool amendOrder(ordId_t aId, ordPx_t aNewPx, ordSz_t aNewSz) {
+        
         // Remove the old resting instance entirely.
-        removeResting(myOrd);
+        clearOrderFromBook(myOrd);
         delete myOrd;
 
-        if (aNewSz <= 0) return myTrades;     // amend-to-zero == cancel
+        if (aNewSz <= 0) return false;     // amend-to-zero == cancel
 
         // Re-add with a fresh timestamp -> loses time priority, may re-cross.
-        myTrades = addOrder(aId, mySide, aNewPx, aNewSz);
-        return myTrades;
+        addOrder<IS_BUY>(aId, mySide, aNewPx, aNewSz);
+        return true;
     }
 
     // ---- introspection -----------------------------------------------------
     void print(FILE* aStream = stdout) const {
         fprintf(aStream, "==== ORDER BOOK ====\n");
+        fprintf(aStream, "BIDS (low->high):\n");
+        for (auto it = bids_.rbegin(); it != bids_.rend(); ++it){it->second->print(aStream);}
         fprintf(aStream, "ASKS (low->high):\n");
-        for (auto it = asks_.begin(); it != asks_.end(); ++it) it->second->print(aStream);
-        fprintf(aStream, "BIDS (high->low):\n");
-        for (auto it = bids_.rbegin(); it != bids_.rend(); ++it) it->second->print(aStream);
+        for (auto it = asks_.begin(); it != asks_.end(); ++it){it->second->print(aStream);}
         fprintf(aStream, "====================\n");
+    }
+    Px2PxLvl& sideMap(bool aIsBuy){
+        if(aIsBuy){return bids_;}
+        else{asks_;}
     }
 
 private:
-    exchange_ticker ticker_ = 0;  // instrument ticker (printed in trade lines)
-    Px2PxLvl    bids_{};      // buy side
-    Px2PxLvl    asks_{};      // sell side
-    Id2OrderPtr orderMap_{};  // id -> resting node
-    Timestamp   clock_ = 0;   // monotonic tick source for time priority
-
-    inline Timestamp nextTs() { return ++clock_; }
-
-    inline Px2PxLvl& sideMap(Side aSide) { return aSide == Side::BUY ? bids_ : asks_; }
+    ExchangeTicker ticker_;  // instrument ticker (printed in trade lines)
+    Px2PxLvl bids_{};      // buy side
+    Px2PxLvl asks_{};      // sell side
+    Id2OrderPtr orderMap_{};  // id -> resting nodei
 
     // Get-or-create the price level on the order's own side, then append.
-    inline void restOrder(OrderNodePtr aOrd) {
-        Px2PxLvl& myMap = sideMap(aOrd->side());
-        PxLvlPtr myLvl;
-        auto myIt = myMap.find(aOrd->px());
-        if (myIt == myMap.end()) { myLvl = new PxLvl(aOrd->px(), ticker_); myMap[aOrd->px()] = myLvl; }
-        else                     { myLvl = myIt->second; }
-        myLvl->insert(aOrd);
+    template<bool IS_BUY>
+    inline void addOrderToBook(OrderNodePtr aOrd) {
+        if constexpr (IS_BUY){
+            addPxLvlToMap(bids_, aOrd);
+        }else{
+            addPxLvlToMap(asks_, aOrd);
+        }
         orderMap_[aOrd->id()] = aOrd;
     }
 
+    inline void addPxLvlToMap(Px2PxLvl& aPxLvlMap, OrderNodePtr aOrd){
+        PxLvlPtr myPxLvl = nullptr;
+        auto myIt = aPxLvlMap.find(aOrd->px());
+        if (myIt == aPxLvlMap.end()) { myPxLvl = new PxLvl(aOrd->px(), ticker_); aPxLvlMap[aOrd->px()] = myPxLvl; }
+        else {myPxLvl = myIt->second;}
+        myPxLvl->insert(aOrd);
+    }
+
+    inline void cleanOrderExistenceFromBook(ordId_t aOrdId){
+        auto myIt = orderMap_.find(aOrdId);
+        if (myIt == orderMap_.end()) {
+            printf("Arror Occured Could not Find Order Correspoding a Ticker %lld and ID %lld \n", ticker_, aOrdId);
+            return;
+        }
+        OrderNodePtr myOrd = myIt->second;
+        removeOrderFromPxMap(myOrd);
+    }
+
     // Unlink a resting order from its level, drop the level if empty, erase map.
-    inline void removeResting(OrderNodePtr aOrd) {
-        Px2PxLvl& myMap = sideMap(aOrd->side());
+    inline void removeOrderFromPxMap(OrderNodePtr aOrd) {
+        Px2PxLvl& myMap = sideMap(aOrd->side() == Side::Buy);
         auto myIt = myMap.find(aOrd->px());
         if (myIt != myMap.end()) {
             PxLvlPtr myLvl = myIt->second;
@@ -143,41 +146,50 @@ private:
         }
         orderMap_.erase(aOrd->id());
     }
-
-    /*
-     * Walk the opposite side from its best price and match while it crosses.
-     *   takerIsBuy  -> oppMap is asks_, cross while askPx <= taker px (ascending)
-     *   !takerIsBuy -> oppMap is bids_, cross while bidPx >= taker px (descending)
-     * Fully filled maker orders are removed from orderMap_ and deleted.
-     */
-    void matchAgainst(Px2PxLvl& aOppMap, OrderNodePtr aTaker,
-                      bool aTakerIsBuy, std::vector<Trade>& aTrades) {
+    
+    void matchAgainstBids(OrderNodePtr aAgressor) {
         std::vector<ordId_t> myFilledIds;
-
-        while (aTaker->sz() > 0 && !aOppMap.empty()) {
-            // Best opposite level: lowest ask, or highest bid.
-            auto myLvlIt = aTakerIsBuy ? aOppMap.begin() : std::prev(aOppMap.end());
-            PxLvlPtr myLvl = myLvlIt->second;
-            ordPx_t  myLvlPx = myLvl->px();
-
-            bool myCrosses = aTakerIsBuy ? (myLvlPx <= aTaker->px())
-                                         : (myLvlPx >= aTaker->px());
-            if (!myCrosses) break;
-
-            myFilledIds.clear();
-            myLvl->matchOrders(aTaker, aTrades, myFilledIds);
-
-            // Drop fully-consumed maker nodes from the id map and free them.
-            for (ordId_t myId : myFilledIds) {
-                auto myMapIt = orderMap_.find(myId);
-                if (myMapIt != orderMap_.end()) {
-                    OrderNodePtr myDone = myMapIt->second;
-                    orderMap_.erase(myMapIt);
-                    delete myDone;
-                }
+	    int fillledSz = 0;
+	    while((bids_.empty())&(aAgressor->sz()>0)){
+            auto bestBid = bids_.rbegin();
+            if (bestBid->first < aAgressor->px()){return;} // there is comparision of double happening here.
+            bestBid->second->matchOrders(aAgressor, myFilledIds);
+            eraseOrderIdsFromMap(myFilledIds); // raising trade here ?
+            if(bestBid->second->isEmpty()){
+                bids_.erase(bestBid->first);
+                delete bestBid->second; // freeing this memory
+            }else{
+                return;
             }
+	    }
+	    return;
+	}
+    ordSz_t matchAgainstAsks(Px2PxLvl& aAskSideMap, OrderNodePtr aAgressor) {
+        std::vector<ordId_t> myFilledIds;
+        auto iter = asks_.begin();
+	    if(iter == asks_.end()){return;}
+	    while((asks_.empty())&(aAgressor->sz()>0)){
+            auto myBestAsk = asks_.begin();
+            if (myBestAsk->first > aAgressor->px()){return;} // there is comparision of double happening here.
+            myBestAsk->second->matchOrders(aAgressor, myFilledIds); // raising trades here .. 
+            eraseOrderIdsFromMap(myFilledIds);
+            if(myBestAsk->second->isEmpty()){
+                asks_.erase(myBestAsk->first);
+                delete myBestAsk->second; // freeing this memory
+            }
+	    }
+	    return;
+    }
 
-            if (myLvl->isEmpty()) { aOppMap.erase(myLvlIt); delete myLvl; }
+
+    void eraseOrderIdsFromMap(std::vector<ordId_t>& aOrdIdsToRemove){
+        for (ordId_t id : aOrdIdsToRemove) {
+            auto it = orderMap_.find(id);
+            if (it != orderMap_.end()) {
+                delete it->second; // Free the actual OrderNode memory
+                orderMap_.erase(it); // remove the traded resting orders in the book from the map
+            }
         }
+        aOrdIdsToRemove.clear(); // lets just clear it here.. 
     }
 };
