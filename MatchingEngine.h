@@ -7,34 +7,40 @@
 #include <unordered_map>
 class MatchingEngine {
 public:
-    template<enum RequestType>
-    void process_message(const Message& msg) {
-        auto& book = books[msg.exchange_id];
-        switch (msg.request_type) {
-            case RequestType::New:
-                if (msg.side == Side::Buy) {
-                    book.match_and_add_bid(msg.order_id, msg.quantity, msg.price);
-                } else {
-                    book.match_and_add_ask(msg.order_id, msg.quantity, msg.price);
-                }
-                break;
-            case RequestType::Cancel:
-                book.handle_cancel(msg.order_id);
-                break;
-            case RequestType::Amend:
-                book.handle_amend(msg.order_id, msg.side, msg.quantity, msg.price);
-                break;
+    template<enum RequestType, bool IS_BUY>
+    void process_message(const Message& aMsg) {
+        OrderBook* myOrderBook = findBookFromTicker(aMsg.exchangeTicker);
+        if constexpr (ReqType == RequestType::NEW) {
+            myOrderBook->addOrder<IS_BUY>(msg.orderId, msg.side, msg.px, msg.qty);
+        } 
+        else if constexpr (ReqType == RequestType::CANCEL) {
+            myOrderBook->cancelOrder(msg.orderId);
+        } 
+        else if constexpr (ReqType == RequestType::AMEND) {
+            myOrderBook->amendOrder<IS_BUY>(msg.orderId, msg.px, msg.sz);
         }
     }
 
     void print_books() const {
-        for (const auto& [id, book] : books) {
+        for (const auto& [id, book] : books_) {
             std::cout << "=== Order Book for Ticker: " << id << " ===\n";
-            book.print();
+            book->print();
         }
     }
 
 private:
-    std::unordered_map<long int, OrderBook> books;
+    std::unordered_map<ExchangeTicker, OrderBook*> books_;
+
+
+
+    OrderBook* findBookFromTicker(long int aTicker){
+        auto myIter = books_.find(aTicker);
+        if(myIter != books_.end()){
+            return myIter->second;
+        }
+        OrderBook* myOrderBook = new OrderBook(aTicker);
+        books_[aTicker] = myOrderBook; 
+        return myOrderBook;
+    }
 };
 
